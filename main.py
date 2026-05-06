@@ -1,7 +1,9 @@
 import os
-import requests
+import json
 import argparse
+import requests
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
@@ -26,13 +28,13 @@ ALLOWED_EXTENSIONS = {
 }
 
 MAX_FILE_SIZE = 15000
-BATCH_SIZE = 12
-
+DEFAULT_MAX_TOKENS_PER_BATCH = 6000
+OUTPUT_TOKEN_RESERVE = 1024
+OLLAMA_NUM_PARALLEL = 2
 
 def should_ignore(path):
     parts = set(Path(path).parts)
     return bool(parts & IGNORE_DIRS)
-
 
 def collect_files(root_dir, target_file=None):
     file_paths = []
@@ -49,20 +51,26 @@ def collect_files(root_dir, target_file=None):
             file_paths.append(full_path)
     return file_paths
 
+def read_file_content(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+            if len(content) > MAX_FILE_SIZE:
+                content = content[:MAX_FILE_SIZE] + "\nTRUNCATED"
+            return (path, content)
+    except Exception as e:
+        return (path, f"ERROR: {str(e)}")
 
-def read_files(file_paths):
+def read_files_parallel(file_paths, max_workers=8):
     data = {}
-    for path in tqdm(file_paths, desc="Reading files"):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                content = f.read()
-                if len(content) > MAX_FILE_SIZE:
-                    content = content[:MAX_FILE_SIZE] + "\nTRUNCATED"
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_path = {executor.submit(read_file_content, p): p for p in file_paths}
+        with tqdm(total=len(file_paths), desc="Reading files") as pbar:
+            for future in as_completed(future_to_path):
+                path, content = future.result()
                 data[path] = content
-        except Exception as e:
-            data[path] = f"ERROR: {str(e)}"
+                pbar.update(1)
     return data
-
 
 def get_structure(root_dir):
     structure = []
@@ -77,6 +85,8 @@ def get_structure(root_dir):
                 structure.append(f"{sub_indent}{file}")
     return "\n".join(structure)
 
+def estimate_tokens(text):
+    return len(text) // 4
 
 def build_prompt_strict(structure, batch_data):
     prompt = f"""
@@ -118,22 +128,14 @@ OUTPUT FORMAT (STRICT JSON, NO EXTRA TEXT):
   "performance_problems": [],
   "code_quality": [],
   "architecture_issues": [],
-  "refactor_plan": [
-    "step 1",
-    "step 2"
-  ],
-  "priority_fix_order": [
-    "1",
-    "2"
-  ]
+  "refactor_plan": [],
+  "priority_fix_order": []
 }}
 
 FILES:
 """
-
     for path, code in batch_data.items():
         prompt += f"\nFILE: {path}\n```\n{code}\n```"
-
     prompt += """
 
 FINAL INSTRUCTION:
@@ -141,7 +143,6 @@ FINAL INSTRUCTION:
 - No explanations outside JSON.
 - If no issues found in a section, return empty list [].
 """
-
     return prompt
 
 def query_ollama(prompt):
@@ -150,54 +151,129 @@ def query_ollama(prompt):
         json={
             "model": MODEL_NAME,
             "prompt": prompt,
-            "stream": False
-        }
+            "stream": False,
+            "format": "json"
+        },
+        timeout=120
     )
     if response.status_code != 200:
-        raise Exception(response.text)
-    return response.json()["response"]
+        raise Exception(f"Ollama API error {response.status_code}: {response.text}")
+    result = response.json()
+    return result.get("response", "")
 
+def merge_results(json_strings):
+    merged = {
+        "critical_bugs": [],
+        "dependency_issues": [],
+        "security_risks": [],
+        "performance_problems": [],
+        "code_quality": [],
+        "architecture_issues": [],
+        "refactor_plan": [],
+        "priority_fix_order": []
+    }
+    for js in json_strings:
+        if not js.strip():
+            continue
+        try:
+            data = json.loads(js)
+        except json.JSONDecodeError:
+            continue
+        for key in merged:
+            if key in data and isinstance(data[key], list):
+                merged[key].extend(data[key])
+    return merged
 
-def batch_analyze(structure, code_data):
-    paths = list(code_data.keys())
-    results = []
-    batches = [paths[i:i + BATCH_SIZE] for i in range(0, len(paths), BATCH_SIZE)]
+def build_token_aware_batches(structure, code_data, max_tokens_per_batch):
+    base_prompt_no_files = build_prompt_strict(structure, {})
+    base_tokens = estimate_tokens(base_prompt_no_files)
+    available_tokens = max_tokens_per_batch - base_tokens
+    if available_tokens <= 0:
+        raise ValueError("max_tokens_per_batch too small for prompt overhead")
 
-    for batch in tqdm(batches, desc="Analyzing batches"):
-        batch_data = {p: code_data[p] for p in batch}
-        prompt = build_prompt(structure, batch_data)
-        result = query_ollama(prompt)
-        results.append(result)
+    batches = []
+    current_batch = {}
+    current_tokens = 0
+    for path, content in code_data.items():
+        file_block = f"\nFILE: {path}\n```\n{content}\n```"
+        block_tokens = estimate_tokens(file_block)
+        if current_tokens + block_tokens > available_tokens:
+            if current_batch:
+                batches.append(current_batch)
+            current_batch = {}
+            current_tokens = 0
+        current_batch[path] = content
+        current_tokens += block_tokens
+    if current_batch:
+        batches.append(current_batch)
+    return batches
 
-    return "\n\n".join(results)
+def process_batch(structure, batch_data):
+    prompt = build_prompt_strict(structure, batch_data)
+    for _ in range(2):
+        try:
+            return query_ollama(prompt)
+        except Exception:
+            continue
+    return ""
 
+def analyze_batches_parallel(structure, batches, num_parallel):
+    results = [None] * len(batches)
+    with ThreadPoolExecutor(max_workers=num_parallel) as executor:
+        future_to_idx = {}
+        for idx, batch_data in enumerate(batches):
+            future = executor.submit(process_batch, structure, batch_data)
+            future_to_idx[future] = idx
+        with tqdm(total=len(batches), desc="Analyzing batches") as pbar:
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    result = future.result()
+                except Exception as e:
+                    result = json.dumps({"error": str(e)})
+                results[idx] = result
+                pbar.update(1)
+    return results
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("directory")
     parser.add_argument("--file", default=None)
+    parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS_PER_BATCH,
+                        help="Max tokens per batch (including output reserve)")
+    parser.add_argument("--parallel", type=int, default=OLLAMA_NUM_PARALLEL,
+                        help="Number of parallel Ollama requests")
+    parser.add_argument("--read-workers", type=int, default=8,
+                        help="Number of threads for file reading")
     args = parser.parse_args()
 
     root_dir = os.path.abspath(args.directory)
 
-    print("Scanning files")
+    print("Scanning files...")
     file_paths = collect_files(root_dir, args.file)
-
     if not file_paths:
-        print("No files found")
+        print("No files found.")
         return
 
     print(f"Total files: {len(file_paths)}")
-
-    code_data = read_files(file_paths)
+    code_data = read_files_parallel(file_paths, max_workers=args.read_workers)
     structure = get_structure(root_dir)
 
-    print("Running analysis")
-    result = batch_analyze(structure, code_data)
+    max_input_tokens = args.max_tokens - OUTPUT_TOKEN_RESERVE
+    if max_input_tokens <= 0:
+        print("Error: max_tokens too low after output reserve.")
+        return
+
+    batches = build_token_aware_batches(structure, code_data, max_input_tokens)
+    print(f"Created {len(batches)} batch(es) with token limit {max_input_tokens}")
+
+    print("Running analysis...")
+    batch_results = analyze_batches_parallel(structure, batches, args.parallel)
+
+    final_result = merge_results(batch_results)
 
     print("\nFINAL OUTPUT\n")
-    print(result)
-
+    print(json.dumps(final_result, indent=2))
 
 if __name__ == "__main__":
     main()
